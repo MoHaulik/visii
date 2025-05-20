@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR 360°/180° Video Player</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; background: #f0f2f5; }
+    #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 9000; }
+    #start-button { padding: 15px 28px; font-size: 18px; background: rgba(255,255,255,0.9); color: black; border: none; border-radius: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.1); cursor: pointer; transition: all 0.2s; font-weight: 600; margin-bottom: 20px; }
+    #start-button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,0.15); }
+    #file-input { display: none; }
+    #file-select { padding: 12px 24px; font-size: 16px; background: rgba(255,255,255,0.8); color: black; border: none; border-radius: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.1); cursor: pointer; transition: all 0.2s; margin-bottom: 10px; }
+    #file-select:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,0.15); }
+    #format-options { background: rgba(255,255,255,0.8); border-radius: 16px; padding: 15px; margin-top: 15px; text-align: center; }
+    #format-options h3 { margin-top: 0; }
+    #format-options label { margin: 5px 10px; display: inline-block; }
+    #status { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.9); color: black; padding: 12px 24px; border-radius: 16px; font-size: 16px; font-weight: 500; display: none; z-index: 9999; }
+    .exit-ar { position: fixed; top: 20px; right: 20px; background: white; color: black; border: none; border-radius: 50%; width: 46px; height: 46px; display: none; align-items: center; justify-content: center; font-size: 24px; cursor: pointer; z-index: 9999; }
+    .xr-active .exit-ar { display: flex; }
+    video { display: block; width: 1px; height: 1px; position: absolute; opacity: 0.01; }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <button id="start-button">Start Immersive Experience</button>
+    <label id="file-select" for="file-input">Choose a 360° or 180° Video</label>
+    <input type="file" id="file-input" accept="video/*">
+    <div id="selected-file"></div>
+    <div id="format-options">
+      <h3>Video Format</h3>
+      <div>
+        <label><input type="radio" name="video-type" value="360" checked> 360° Video</label>
+        <label><input type="radio" name="video-type" value="180"> 180° Video</label>
+      </div>
+      <div>
+        <label><input type="radio" name="stereo-mode" value="mono" checked> Monoscopic</label>
+        <label><input type="radio" name="stereo-mode" value="sbs"> Side-by-Side Stereo</label>
+        <label><input type="radio" name="stereo-mode" value="tb"> Top-Bottom Stereo</label>
+      </div>
+    </div>
+  </div>
+  <button class="exit-ar" id="exit-ar">×</button>
+  <div id="status"></div>
+  <video id="video" loop playsinline crossorigin="anonymous"></video>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+
+    // Main variables
+    let camera, scene, renderer, sphere, controllers = [], xrSession = null;
+    let isPlaying = false;
+    let videoElement, videoTexture, videoMaterial;
+    let videoType = '360';
+    let stereoMode = 'mono';
+    let maxLat = Math.PI; // Full 360 by default
+    
+    // Scrubbing variables
+    let longPressThreshold = 500; // milliseconds
+    let isLongPress = false;
+    let pressStartTime = 0;
+    let pressTimer = null;
+    let controllerStartPosition = new THREE.Vector3();
+    let isScrubbing = false;
+    let scrubSpeed = 5; // seconds per unit of movement
+    let scrubFeedback = null;
+    
+    // Setup renderer and scene
+    function init() {
+      // Scene setup
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+      
+      // Renderer setup
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      // Basic lighting
+      scene.add(new THREE.AmbientLight(0x404040));
+      
+      // Create video element and texture
+      videoElement = document.getElementById('video');
+      videoTexture = new THREE.VideoTexture(videoElement);
+      videoTexture.minFilter = THREE.LinearFilter;
+      videoTexture.magFilter = THREE.LinearFilter;
+      videoTexture.format = THREE.RGBAFormat;
+      
+      // Initial material (will be updated based on video type)
+      videoMaterial = new THREE.MeshBasicMaterial({
+        map: videoTexture,
+        side: THREE.BackSide, // View from inside
+      });
+      
+      // Event listeners
+      window.addEventListener('resize', onWindowResize);
+      document.getElementById('start-button').addEventListener('click', startXR);
+      document.getElementById('exit-ar').addEventListener('click', () => { if (xrSession) xrSession.end(); });
+      document.getElementById('file-input').addEventListener('change', handleFileSelect);
+      
+      // Format option listeners
+      document.querySelectorAll('input[name="video-type"]').forEach(input => {
+        input.addEventListener('change', (event) => {
+          videoType = event.target.value;
+          updateVideoGeometry();
+        });
+      });
+      
+      document.querySelectorAll('input[name="stereo-mode"]').forEach(input => {
+        input.addEventListener('change', (event) => {
+          stereoMode = event.target.value;
+          updateVideoMaterial();
+        });
+      });
+    }
+
+    function onWindowResize() {
+      if (camera) {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    
+    function handleFileSelect(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      
+      // Display selected filename
+      document.getElementById('selected-file').textContent = `Selected: ${file.name}`;
+      
+      // Create URL for the video
+      const videoURL = URL.createObjectURL(file);
+      videoElement.src = videoURL;
+      
+      // Preload metadata
+      videoElement.addEventListener('loadedmetadata', () => {
+        updateStatus(`Video loaded: ${file.name} (${videoElement.videoWidth}x${videoElement.videoHeight})`);
+      });
+      
+      // Update material and geometry based on selected options
+      updateVideoMaterial();
+      updateVideoGeometry();
+    }
+    
+    function updateVideoGeometry() {
+      // Remove existing sphere if present
+      if (sphere) {
+        scene.remove(sphere);
+        if (sphere.geometry) sphere.geometry.dispose();
+      }
+      
+      // Create geometry based on video type
+      let geometry;
+      
+      if (videoType === '360') {
+        // Full spherical geometry for 360 videos
+        geometry = new THREE.SphereGeometry(10, 64, 32);
+        maxLat = Math.PI; // Full latitude range
+      } else if (videoType === '180') {
+        // Half-sphere for 180 videos facing forward (negative Z axis)
+        geometry = new THREE.SphereGeometry(10, 64, 32, Math.PI, Math.PI);
+        maxLat = Math.PI / 2; // Half latitude range
+      }
+      
+      // Create mesh and add to scene
+      sphere = new THREE.Mesh(geometry, videoMaterial);
+      scene.add(sphere);
+    }
+    
+    function updateVideoMaterial() {
+      // Create appropriate shader based on stereo mode
+      if (stereoMode === 'mono') {
+        // Standard monoscopic video
+        videoMaterial.map = videoTexture;
+      } else {
+        // Create stereo shaders for side-by-side or top-bottom formats
+        const isSBS = stereoMode === 'sbs';
+        
+        videoMaterial = new THREE.ShaderMaterial({
+          uniforms: {
+            map: { value: videoTexture },
+            eyeIndex: { value: 0 }  // 0 for left eye, 1 for right eye
+          },
+          vertexShader: `
+            varying vec2 vUv;
+            void main() {
+              vUv = uv;
+              gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+          `,
+          fragmentShader: `
+            uniform sampler2D map;
+            uniform int eyeIndex;
+            varying vec2 vUv;
+            
+            void main() {
+              vec2 uv = vUv;
+              
+              // Adjust UV based on stereo format and current eye
+              if (eyeIndex == 0) {
+                // Left eye
+                uv.x = ${isSBS ? 'uv.x * 0.5' : 'uv.x'};
+                uv.y = ${isSBS ? 'uv.y' : 'uv.y * 0.5 + 0.5'};
+              } else {
+                // Right eye
+                uv.x = ${isSBS ? 'uv.x * 0.5 + 0.5' : 'uv.x'};
+                uv.y = ${isSBS ? 'uv.y' : 'uv.y * 0.5'};
+              }
+              
+              gl_FragColor = texture2D(map, uv);
+            }
+          `,
+          side: THREE.BackSide
+        });
+        
+        // Update sphere with new material if it exists
+        if (sphere) {
+          sphere.material = videoMaterial;
+        }
+      }
+    }
+    
+    // Start WebXR session
+    function startXR() {
+      if (!navigator.xr) {
+        updateStatus('WebXR not supported in this browser');
+        return;
+      }
+      
+      if (!videoElement.src) {
+        updateStatus('Please select a video file first');
+        return;
+      }
+      
+      // Check for VR support
+      navigator.xr.isSessionSupported('immersive-vr')
+        .then(supported => {
+          if (supported) {
+            startImmersiveSession();
+          } else {
+            updateStatus('VR not supported on this device');
+          }
+        });
+    }
+    
+    function startImmersiveSession() {
+      navigator.xr.requestSession('immersive-vr', {
+        optionalFeatures: ['hand-tracking']
+      })
+      .then(onSessionStarted)
+      .catch(err => updateStatus('Failed to start VR session: ' + err.message));
+    }
+    
+    function onSessionStarted(session) {
+      xrSession = session;
+      document.getElementById('overlay').style.display = 'none';
+      document.body.classList.add('xr-active');
+      
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      
+      // Setup controllers with enhanced interaction for scrubbing
+      controllers = [0, 1].map(i => {
+        const controller = renderer.xr.getController(i);
+        
+        // Enhanced selectstart event for scrubbing
+        controller.addEventListener('selectstart', (event) => {
+          pressStartTime = Date.now();
+          
+          // Store initial controller position
+          controller.getWorldPosition(controllerStartPosition);
+          
+          // Set timer for long press detection
+          pressTimer = setTimeout(() => {
+            if (!isScrubbing) {
+              isLongPress = true;
+              isScrubbing = true;
+              
+              // Create visual feedback for scrubbing
+              createScrubFeedback(controller);
+              
+              updateStatus('Scrubbing mode: Move controller up/down');
+            }
+          }, longPressThreshold);
+        });
+        
+        // Handle selectend
+        controller.addEventListener('selectend', () => {
+          clearTimeout(pressTimer);
+          
+          // If it was a short press, toggle play/pause
+          if (!isLongPress && !isScrubbing) {
+            if (!isPlaying) {
+              playVideo();
+            } else {
+              videoElement.pause();
+              isPlaying = false;
+              updateStatus('Paused');
+            }
+          }
+          
+          // Reset scrubbing state
+          isLongPress = false;
+          isScrubbing = false;
+          
+          // Remove scrub feedback
+          if (scrubFeedback) {
+            scene.remove(scrubFeedback);
+            scrubFeedback = null;
+          }
+        });
+        
+        scene.add(controller);
+        return controller;
+      });
+      
+      // Create UI elements in VR
+      createVRUI();
+      
+      // Start render loop
+      renderer.setAnimationLoop(render);
+      
+      // Handle session end
+      session.addEventListener('end', onSessionEnd);
+      
+      updateStatus('Ready! Tap to play/pause, long press & move up/down to scrub');
+    }
+    
+    function createScrubFeedback(controller) {
+      // Create visual indicator for scrubbing
+      if (scrubFeedback) {
+        scene.remove(scrubFeedback);
+      }
+      
+      // Create a simple line geometry extending up/down
+      const geometry = new THREE.CylinderGeometry(0.01, 0.01, 1, 8);
+      geometry.rotateX(Math.PI / 2); // Orient the cylinder vertically
+      
+      const material = new THREE.MeshBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.7 });
+      
+      scrubFeedback = new THREE.Mesh(geometry, material);
+      scrubFeedback.position.set(0, 0, -0.15); // Position slightly in front of controller
+      
+      controller.add(scrubFeedback);
+    }
+    
+    function handleScrubbing(controller) {
+      if (!isScrubbing || !videoElement.duration) return;
+      
+      // Get current controller position
+      const currentPosition = new THREE.Vector3();
+      controller.getWorldPosition(currentPosition);
+      
+      // Calculate vertical movement
+      const verticalDelta = currentPosition.y - controllerStartPosition.y;
+      
+      // Scale the movement to scrub video
+      // Positive delta (up) = forward, Negative delta (down) = backward
+      const timeChange = verticalDelta * scrubSpeed;
+      
+      // Update video time
+      const newTime = Math.min(Math.max(0, videoElement.currentTime + timeChange), videoElement.duration);
+      
+      if (newTime !== videoElement.currentTime) {
+        videoElement.currentTime = newTime;
+        
+        // Update visual feedback - scale the indicator based on scrub direction
+        if (scrubFeedback) {
+          const scaleY = 1 + Math.abs(verticalDelta) * 3; // Scale based on movement
+          scrubFeedback.scale.set(1, scaleY, 1);
+          
+          // Change color based on direction
+          if (verticalDelta > 0) {
+            scrubFeedback.material.color.set(0x00ff00); // Green for forward
+          } else {
+            scrubFeedback.material.color.set(0xff6600); // Orange for backward
+          }
+        }
+        
+        // Show scrubbing status (percentage through video)
+        const percent = Math.round((newTime / videoElement.duration) * 100);
+        updateStatus(`Scrubbing: ${percent}%`);
+      }
+      
+      // Update controller start position for next frame's calculation
+      controllerStartPosition.copy(currentPosition);
+    }
+    
+    function createVRUI() {
+      // Add a simple floating play button or controls
+      // For simplicity, we'll just use controller interaction in this example
+    }
+    
+    function onSessionEnd() {
+      document.getElementById('overlay').style.display = 'flex';
+      document.body.classList.remove('xr-active');
+      document.getElementById('status').style.display = 'none';
+      
+      // Pause video
+      if (videoElement) {
+        videoElement.pause();
+        isPlaying = false;
+      }
+      
+      // Reset scrubbing state
+      isLongPress = false;
+      isScrubbing = false;
+      if (scrubFeedback) {
+        scene.remove(scrubFeedback);
+        scrubFeedback = null;
+      }
+      
+      controllers = [];
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+    }
+    
+    function playVideo() {
+      if (videoElement && videoElement.src) {
+        videoElement.play()
+          .then(() => {
+            isPlaying = true;
+            updateStatus('Playing video');
+          })
+          .catch(error => {
+            updateStatus('Error playing video: ' + error.message);
+          });
+      }
+    }
+    
+    function render(timestamp, frame) {
+      // If we have a stereo video, update the eye index based on current view
+      if (stereoMode !== 'mono' && frame) {
+        const viewer = frame.getViewerPose(renderer.xr.getReferenceSpace());
+        if (viewer) {
+          const view = viewer.views[0]; // Left eye is index 0, right eye is index 1
+          if (videoMaterial.uniforms && view) {
+            // Set the eye index based on which eye is being rendered
+            videoMaterial.uniforms.eyeIndex.value = view.eye === 'right' ? 1 : 0;
+          }
+        }
+      }
+      
+      // Handle scrubbing if active
+      if (isScrubbing && controllers.length > 0) {
+        // Find the controller that is currently active (either one)
+        for (const controller of controllers) {
+          if (controller.userData.isActive) {
+            handleScrubbing(controller);
+            break;
+          }
+        }
+      }
+      
+      // Update video texture
+      if (videoTexture) videoTexture.needsUpdate = true;
+      
+      // Render the scene
+      renderer.render(scene, camera);
+    }
+    
+    function updateStatus(message) {
+      const statusElement = document.getElementById('status');
+      statusElement.textContent = message;
+      statusElement.style.display = 'block';
+      
+      // Auto-hide after 3 seconds for non-error messages
+      if (!message.toLowerCase().includes('error') && !message.toLowerCase().includes('not supported')) {
+        setTimeout(() => { statusElement.style.display = 'none'; }, 3000);
+      }
+    }
+    
+    // Initialize app
+    init();
+  </script>
+</body>
+</html>
