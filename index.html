@@ -55,14 +55,14 @@
     let stereoMode = 'mono';
     let maxLat = Math.PI; // Full 360 by default
     
-    // Scrubbing variables
-    let longPressThreshold = 500; // milliseconds
-    let isLongPress = false;
-    let pressStartTime = 0;
-    let pressTimer = null;
-    let controllerStartPosition = new THREE.Vector3();
+    // Scrubbing control variables
+    let controllerState = [
+      { isPressed: false, pressStartTime: 0, longPressActive: false, startPosition: null, currentPosition: null },
+      { isPressed: false, pressStartTime: 0, longPressActive: false, startPosition: null, currentPosition: null }
+    ];
+    const LONG_PRESS_THRESHOLD = 500; // ms before a press becomes a long press
+    const SCRUB_SENSITIVITY = 10; // How sensitive scrubbing is (higher = more sensitive)
     let isScrubbing = false;
-    let scrubSpeed = 5; // seconds per unit of movement
     let scrubFeedback = null;
     
     // Setup renderer and scene
@@ -261,56 +261,13 @@
       renderer.xr.setReferenceSpaceType('local');
       renderer.xr.setSession(session);
       
-      // Setup controllers with enhanced interaction for scrubbing
+      // Setup controllers
       controllers = [0, 1].map(i => {
         const controller = renderer.xr.getController(i);
         
-        // Enhanced selectstart event for scrubbing
-        controller.addEventListener('selectstart', (event) => {
-          pressStartTime = Date.now();
-          
-          // Store initial controller position
-          controller.getWorldPosition(controllerStartPosition);
-          
-          // Set timer for long press detection
-          pressTimer = setTimeout(() => {
-            if (!isScrubbing) {
-              isLongPress = true;
-              isScrubbing = true;
-              
-              // Create visual feedback for scrubbing
-              createScrubFeedback(controller);
-              
-              updateStatus('Scrubbing mode: Move controller up/down');
-            }
-          }, longPressThreshold);
-        });
-        
-        // Handle selectend
-        controller.addEventListener('selectend', () => {
-          clearTimeout(pressTimer);
-          
-          // If it was a short press, toggle play/pause
-          if (!isLongPress && !isScrubbing) {
-            if (!isPlaying) {
-              playVideo();
-            } else {
-              videoElement.pause();
-              isPlaying = false;
-              updateStatus('Paused');
-            }
-          }
-          
-          // Reset scrubbing state
-          isLongPress = false;
-          isScrubbing = false;
-          
-          // Remove scrub feedback
-          if (scrubFeedback) {
-            scene.remove(scrubFeedback);
-            scrubFeedback = null;
-          }
-        });
+        // Add controller event listeners for scrubbing
+        controller.addEventListener('selectstart', () => handleControllerSelectStart(i));
+        controller.addEventListener('selectend', () => handleControllerSelectEnd(i));
         
         scene.add(controller);
         return controller;
@@ -325,72 +282,75 @@
       // Handle session end
       session.addEventListener('end', onSessionEnd);
       
-      updateStatus('Ready! Tap to play/pause, long press & move up/down to scrub');
+      updateStatus('Ready! Press trigger to play/pause, or hold and move up/down to scrub');
     }
     
-    function createScrubFeedback(controller) {
-      // Create visual indicator for scrubbing
-      if (scrubFeedback) {
-        scene.remove(scrubFeedback);
-      }
+    function handleControllerSelectStart(controllerIndex) {
+      const state = controllerState[controllerIndex];
+      state.isPressed = true;
+      state.pressStartTime = Date.now();
       
-      // Create a simple line geometry extending up/down
-      const geometry = new THREE.CylinderGeometry(0.01, 0.01, 1, 8);
-      geometry.rotateX(Math.PI / 2); // Orient the cylinder vertically
+      // Store initial position
+      state.startPosition = new THREE.Vector3();
+      controllers[controllerIndex].getWorldPosition(state.startPosition);
+      state.currentPosition = state.startPosition.clone();
       
-      const material = new THREE.MeshBasicMaterial({ color: 0x00ffff, transparent: true, opacity: 0.7 });
-      
-      scrubFeedback = new THREE.Mesh(geometry, material);
-      scrubFeedback.position.set(0, 0, -0.15); // Position slightly in front of controller
-      
-      controller.add(scrubFeedback);
-    }
-    
-    function handleScrubbing(controller) {
-      if (!isScrubbing || !videoElement.duration) return;
-      
-      // Get current controller position
-      const currentPosition = new THREE.Vector3();
-      controller.getWorldPosition(currentPosition);
-      
-      // Calculate vertical movement
-      const verticalDelta = currentPosition.y - controllerStartPosition.y;
-      
-      // Scale the movement to scrub video
-      // Positive delta (up) = forward, Negative delta (down) = backward
-      const timeChange = verticalDelta * scrubSpeed;
-      
-      // Update video time
-      const newTime = Math.min(Math.max(0, videoElement.currentTime + timeChange), videoElement.duration);
-      
-      if (newTime !== videoElement.currentTime) {
-        videoElement.currentTime = newTime;
-        
-        // Update visual feedback - scale the indicator based on scrub direction
-        if (scrubFeedback) {
-          const scaleY = 1 + Math.abs(verticalDelta) * 3; // Scale based on movement
-          scrubFeedback.scale.set(1, scaleY, 1);
-          
-          // Change color based on direction
-          if (verticalDelta > 0) {
-            scrubFeedback.material.color.set(0x00ff00); // Green for forward
-          } else {
-            scrubFeedback.material.color.set(0xff6600); // Orange for backward
+      // If the video isn't playing, play it on short press
+      if (!isPlaying) {
+        // Wait a moment to see if this is a long press
+        setTimeout(() => {
+          // If still pressed, this is becoming a long press - don't play
+          if (state.isPressed && !state.longPressActive) {
+            playVideo();
           }
+        }, 200);
+      }
+    }
+    
+    function handleControllerSelectEnd(controllerIndex) {
+      const state = controllerState[controllerIndex];
+      const pressDuration = Date.now() - state.pressStartTime;
+      
+      // If it was a long press, end scrubbing
+      if (state.longPressActive) {
+        state.longPressActive = false;
+        isScrubbing = false;
+        
+        // Remove scrub feedback if it exists
+        if (scrubFeedback) {
+          scene.remove(scrubFeedback);
+          scrubFeedback = null;
         }
         
-        // Show scrubbing status (percentage through video)
-        const percent = Math.round((newTime / videoElement.duration) * 100);
-        updateStatus(`Scrubbing: ${percent}%`);
+        updateStatus(`Scrubbing ended at ${formatTime(videoElement.currentTime)}`);
+      } 
+      // If it was a short press and we're playing, pause
+      else if (pressDuration < LONG_PRESS_THRESHOLD && isPlaying) {
+        videoElement.pause();
+        isPlaying = false;
+        updateStatus('Video paused');
       }
       
-      // Update controller start position for next frame's calculation
-      controllerStartPosition.copy(currentPosition);
+      // Reset controller state
+      state.isPressed = false;
+      state.pressStartTime = 0;
+      state.startPosition = null;
+      state.currentPosition = null;
     }
     
     function createVRUI() {
-      // Add a simple floating play button or controls
-      // For simplicity, we'll just use controller interaction in this example
+      // Create visual feedback for scrubbing
+      scrubFeedback = new THREE.Mesh(
+        new THREE.PlaneGeometry(1, 0.2),
+        new THREE.MeshBasicMaterial({
+          color: 0xffffff,
+          transparent: true,
+          opacity: 0.8
+        })
+      );
+      scrubFeedback.position.set(0, 0, -2); // Position in front of the user
+      scrubFeedback.visible = false;
+      scene.add(scrubFeedback);
     }
     
     function onSessionEnd() {
@@ -404,17 +364,21 @@
         isPlaying = false;
       }
       
-      // Reset scrubbing state
-      isLongPress = false;
-      isScrubbing = false;
+      controllers = [];
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+      
+      // Reset controller states
+      controllerState = [
+        { isPressed: false, pressStartTime: 0, longPressActive: false, startPosition: null, currentPosition: null },
+        { isPressed: false, pressStartTime: 0, longPressActive: false, startPosition: null, currentPosition: null }
+      ];
+      
+      // Remove scrub feedback
       if (scrubFeedback) {
         scene.remove(scrubFeedback);
         scrubFeedback = null;
       }
-      
-      controllers = [];
-      renderer.setAnimationLoop(null);
-      xrSession = null;
     }
     
     function playVideo() {
@@ -430,7 +394,86 @@
       }
     }
     
+    function formatTime(seconds) {
+      const mins = Math.floor(seconds / 60);
+      const secs = Math.floor(seconds % 60);
+      return `${mins}:${secs.toString().padStart(2, '0')}`;
+    }
+    
+    function handleScrubbing(controllerIndex) {
+      const state = controllerState[controllerIndex];
+      
+      // Check if this is a long press
+      if (state.isPressed) {
+        const pressDuration = Date.now() - state.pressStartTime;
+        
+        // If we've reached the long press threshold and haven't activated long press yet
+        if (pressDuration >= LONG_PRESS_THRESHOLD && !state.longPressActive) {
+          state.longPressActive = true;
+          isScrubbing = true;
+          
+          // Pause video during scrubbing
+          if (isPlaying) {
+            videoElement.pause();
+          }
+          
+          updateStatus('Scrubbing active - move controller up/down');
+          
+          // Show scrub feedback
+          if (scrubFeedback) {
+            scrubFeedback.visible = true;
+          }
+        }
+        
+        // If long press is active, handle scrubbing based on controller movement
+        if (state.longPressActive) {
+          // Update current position
+          const newPosition = new THREE.Vector3();
+          controllers[controllerIndex].getWorldPosition(newPosition);
+          state.currentPosition = newPosition;
+          
+          // Calculate vertical movement from start position
+          const verticalDelta = state.currentPosition.y - state.startPosition.y;
+          
+          // Apply scrubbing if there's significant movement
+          if (Math.abs(verticalDelta) > 0.01) {
+            // Calculate scrub amount (positive = forward, negative = backward)
+            const scrubAmount = verticalDelta * SCRUB_SENSITIVITY;
+            
+            // Calculate new time
+            let newTime = videoElement.currentTime + scrubAmount;
+            
+            // Clamp time between 0 and video duration
+            newTime = Math.max(0, Math.min(videoElement.duration, newTime));
+            
+            // Apply new time
+            videoElement.currentTime = newTime;
+            
+            // Update status
+            updateStatus(`Scrubbing: ${formatTime(newTime)} / ${formatTime(videoElement.duration)}`);
+            
+            // Reset start position for continuous movement
+            state.startPosition = state.currentPosition.clone();
+            
+            // Update scrub feedback position
+            if (scrubFeedback) {
+              // Position in front of the user and scale based on progress
+              const progress = newTime / videoElement.duration;
+              scrubFeedback.scale.x = Math.max(0.2, progress);
+            }
+          }
+        }
+      }
+    }
+    
     function render(timestamp, frame) {
+      // Handle scrubbing for both controllers
+      for (let i = 0; i < controllers.length; i++) {
+        if (controllerState[i].isPressed) {
+          handleScrubbing(i);
+        }
+      }
+      
       // If we have a stereo video, update the eye index based on current view
       if (stereoMode !== 'mono' && frame) {
         const viewer = frame.getViewerPose(renderer.xr.getReferenceSpace());
@@ -439,17 +482,6 @@
           if (videoMaterial.uniforms && view) {
             // Set the eye index based on which eye is being rendered
             videoMaterial.uniforms.eyeIndex.value = view.eye === 'right' ? 1 : 0;
-          }
-        }
-      }
-      
-      // Handle scrubbing if active
-      if (isScrubbing && controllers.length > 0) {
-        // Find the controller that is currently active (either one)
-        for (const controller of controllers) {
-          if (controller.userData.isActive) {
-            handleScrubbing(controller);
-            break;
           }
         }
       }
@@ -467,7 +499,9 @@
       statusElement.style.display = 'block';
       
       // Auto-hide after 3 seconds for non-error messages
-      if (!message.toLowerCase().includes('error') && !message.toLowerCase().includes('not supported')) {
+      if (!message.toLowerCase().includes('error') && 
+          !message.toLowerCase().includes('not supported') &&
+          !message.toLowerCase().includes('scrubbing')) {
         setTimeout(() => { statusElement.style.display = 'none'; }, 3000);
       }
     }
